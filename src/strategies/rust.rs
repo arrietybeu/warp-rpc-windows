@@ -2,10 +2,14 @@
 ///
 /// Detection triggers (any one is sufficient)
 /// ───────────────────────────────────────────
-///   • Title contains "cargo"              — running a cargo command
-///   • Title contains "rust"               — Rust-related activity
-///   • Title contains ".rs"                — editing a Rust source file
-///   • `cargo.exe` in the process list     — background build/check
+///   • Title contains "cargo"  — running a cargo command
+///   • Title contains "rust"   — Rust-related activity
+///   • Title contains ".rs"    — editing a Rust source file
+///
+/// NOTE: We intentionally do NOT check for `cargo.exe` in the process list.
+/// With the foreground-window model the only reliable signal is the active
+/// tab's title.  A cargo build running in a DIFFERENT tab would otherwise
+/// trigger this detector for unrelated tabs (e.g. a Claude Code tab).
 ///
 /// State line mapping
 /// ──────────────────
@@ -16,7 +20,7 @@
 ///   "cargo clippy …" →  "Running: Clippy"
 ///   "cargo fmt …"    →  "Running: Fmt"
 ///   (other)          →  "Running: Cargo"
-use crate::models::{PresenceData, ProcessInfo};
+use crate::models::PresenceData;
 use crate::strategies::AppDetector;
 
 /// (lowercase subcommand, display label)
@@ -35,15 +39,14 @@ const SUBCOMMANDS: &[(&str, &str)] = &[
 pub struct RustDetector;
 
 impl AppDetector for RustDetector {
-    fn detect(&self, window_title: &str, processes: &[ProcessInfo]) -> Option<PresenceData> {
+    fn detect(&self, window_title: &str) -> Option<PresenceData> {
         let title_lower = window_title.to_lowercase();
 
         let rust_in_title = title_lower.contains("cargo")
             || title_lower.contains("rust")
             || title_lower.contains(".rs");
-        let cargo_process = processes.iter().any(|p| p.name == "cargo.exe");
 
-        if !rust_in_title && !cargo_process {
+        if !rust_in_title {
             return None;
         }
 

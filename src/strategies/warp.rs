@@ -1,29 +1,35 @@
-/// Warp Terminal detector — priority 5 (default fallback).
+/// Warp Terminal detector — priority 4 (guaranteed fallback).
 ///
-/// Fires whenever `warp.exe` is running, regardless of window focus or title
-/// content. All higher-priority detectors have already declined by the time
-/// this runs, so no secondary keyword checks are needed here.
+/// This detector always returns `Some` — it is the last in the chain and is
+/// only reached when no higher-priority detector claimed the presence.  The
+/// monitor already confirmed `warp.exe` is the foreground process, so the
+/// process-list guard is intentionally omitted here.
 ///
-/// State line: "Context: <folder>" where <folder> is extracted from Warp's
-/// window title using the "folder — Warp" format.
-use crate::models::{PresenceData, ProcessInfo};
+/// Claude detection is absorbed here:
+///   • Title contains "claude" → large_image = "claude"
+///   • Otherwise              → large_image = "warp"
+///
+/// State line: "Context: <folder>" extracted from Warp's "folder — Warp" title format.
+use crate::models::PresenceData;
 use crate::strategies::AppDetector;
 
 pub struct WarpDetector;
 
 impl AppDetector for WarpDetector {
-    fn detect(&self, window_title: &str, processes: &[ProcessInfo]) -> Option<PresenceData> {
-        if !processes.iter().any(|p| p.name == "warp.exe") {
-            return None;
-        }
-
+    fn detect(&self, window_title: &str) -> Option<PresenceData> {
         let folder = extract_folder(window_title);
+
+        let (large_image, large_text) = if window_title.to_lowercase().contains("claude") {
+            ("claude", "Claude AI")
+        } else {
+            ("warp", "Warp Pro")
+        };
 
         Some(PresenceData {
             details: "Warp Terminal Session".to_owned(),
             state: format!("Context: {folder}"),
-            large_image: "warp",
-            large_text: "Warp Pro",
+            large_image,
+            large_text,
             small_image: "warp",
             small_text: "Warp Pro",
         })

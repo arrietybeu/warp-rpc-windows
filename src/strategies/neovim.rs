@@ -21,22 +21,19 @@
 ///   project  = grandparent directory (e.g. "tram-quy" from …/tram-quy/src/main.rs)
 use std::path::Path;
 
-use crate::models::{PresenceData, ProcessInfo};
+use crate::models::PresenceData;
 use crate::strategies::AppDetector;
 
 pub struct NeovimDetector;
 
 impl AppDetector for NeovimDetector {
-    fn detect(&self, window_title: &str, processes: &[ProcessInfo]) -> Option<PresenceData> {
+    fn detect(&self, window_title: &str) -> Option<PresenceData> {
         let title_lower = window_title.to_lowercase();
 
-        let nvim_in_title =
-            title_lower.contains("nvim") || title_lower.contains("neovim");
-        let nvim_process = processes
-            .iter()
-            .any(|p| p.name == "nvim.exe" || p.name == "neovim.exe");
-
-        if !nvim_in_title && !nvim_process {
+        // Title-only detection: if nvim is running in a different Warp tab its
+        // process would appear in the list but the ACTIVE tab's title would not
+        // contain "nvim", so a process-list check would fire on the wrong tab.
+        if !title_lower.contains("nvim") && !title_lower.contains("neovim") {
             return None;
         }
 

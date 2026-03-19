@@ -1,14 +1,5 @@
 /// Shared data structures used by the monitor, strategies, and presence modules.
 
-// ─── Process snapshot ─────────────────────────────────────────────────────────
-
-/// A lightweight view of a running process.
-/// The `name` field is always lower-case so detectors can compare without
-/// calling `to_lowercase()` themselves.
-pub struct ProcessInfo {
-    pub name: String,
-}
-
 // ─── Presence payload ─────────────────────────────────────────────────────────
 
 /// Everything `PresenceManager::update` needs to push one Discord activity.

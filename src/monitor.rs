@@ -4,7 +4,10 @@
 ///   1. Refresh the process list (sysinfo).
 ///   2. Confirm `warp.exe` is running at all — if not, return `None`.
 ///   3. Call `GetForegroundWindow` to get the window the user is looking at.
-///   4. Verify that window's PID belongs to a `warp.exe` process.
+///   4. Verify that window's PID (or its parent's PID) belongs to a `warp.exe`
+///      process.  Warp on Windows can host the active window under a GPU/render
+///      child process rather than the main warp.exe — checking one level up in
+///      the process tree makes the check robust to that.
 ///      If the active window is NOT Warp (browser, Discord, etc.), return `None`
 ///      so the caller can clear the Discord presence immediately.
 ///   5. Read that window's title with `GetWindowTextW` — this is always the
@@ -13,21 +16,17 @@
 ///
 /// Returning `Option` gives `main.rs` a clean signal: `None` means "nothing
 /// to show", `Some` means "show this snapshot".
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
 };
-
-use crate::models::ProcessInfo;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
 pub struct SystemSnapshot {
     /// Title of the active (focused) Warp window — reflects the current tab.
     pub title: String,
-    /// All running processes with lower-cased names.
-    pub processes: Vec<ProcessInfo>,
 }
 
 // ─── Monitor ──────────────────────────────────────────────────────────────────
@@ -48,16 +47,6 @@ impl SystemMonitor {
             ProcessesToUpdate::All,
             ProcessRefreshKind::everything(),
         );
-
-        // Collect all processes (lower-cased names for detectors).
-        let processes: Vec<ProcessInfo> = self
-            .sys
-            .processes()
-            .values()
-            .map(|p| ProcessInfo {
-                name: p.name().to_str().unwrap_or("").to_lowercase(),
-            })
-            .collect();
 
         // Bail out early if Warp is not running at all.
         let warp_pids: Vec<u32> = self
@@ -80,18 +69,46 @@ impl SystemMonitor {
         // Ask Windows which window the user is currently looking at.
         let (hwnd, fg_pid) = foreground_window();
 
-        // If the focused window does not belong to Warp, produce no snapshot.
-        // This clears presence the moment the user alt-tabs away from Warp.
-        if !warp_pids.contains(&fg_pid) {
+        // Check whether the foreground window belongs to Warp — either directly
+        // (fg_pid is a warp.exe PID) or indirectly (fg_pid is a child of warp.exe).
+        // The indirect check is necessary because Warp on Windows can host tabs
+        // under GPU/renderer subprocesses whose PID differs from the main warp.exe.
+        //
+        // We also explicitly ignore our own PID: in debug builds this process has a
+        // visible console window, and Windows can briefly give it keyboard focus
+        // right after we write to it (eprintln!).  That transient focus steal must
+        // not be misread as "user switched away from Warp".
+        let our_pid = std::process::id();
+        let is_warp_window = warp_pids.contains(&fg_pid)
+            || fg_pid == our_pid
+            || {
+                self.sys
+                    .process(Pid::from_u32(fg_pid))
+                    .and_then(|p| p.parent())
+                    .map(|parent_pid| warp_pids.contains(&parent_pid.as_u32()))
+                    .unwrap_or(false)
+            };
+
+        #[cfg(debug_assertions)]
+        if !is_warp_window {
+            eprintln!(
+                "[warp-rpc] monitor: fg_pid={fg_pid} not in warp_pids={warp_pids:?} — skipping"
+            );
+        }
+
+        if !is_warp_window {
             return None;
         }
 
         // The foreground window IS a Warp window — read its title.
-        // This is the title of the active tab, so switching tabs is reflected
-        // on the very next poll without any special handling.
-        let title = window_text(hwnd)?;
+        // unwrap_or_default() is intentional: a blank/new Warp tab returns an
+        // empty window title. We must NOT propagate None here, because that
+        // would skip every detector (including WarpDetector) and clear the
+        // Discord presence. An empty title is handled gracefully downstream —
+        // WarpDetector will show a generic "Warp Terminal Session" fallback.
+        let title = window_text(hwnd).unwrap_or_default();
 
-        Some(SystemSnapshot { title, processes })
+        Some(SystemSnapshot { title })
     }
 }
 
