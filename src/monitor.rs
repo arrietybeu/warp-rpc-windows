@@ -1,36 +1,40 @@
-/// Process + window-title detection for Warp Terminal.
+/// System monitor: gathers the window title and process list each poll tick.
 ///
-/// Strategy
-/// --------
-/// 1. Use `sysinfo` to enumerate live processes and collect every PID whose
-///    image name matches `warp.exe` (case-insensitive).
-/// 2. Use `EnumWindows` to walk all top-level windows.  For each visible
-///    window that belongs to one of those PIDs, read its title with
-///    `GetWindowTextW`.  The first non-empty title wins.
+/// Title resolution strategy
+/// ─────────────────────────
+/// 1. If `warp.exe` is running, search every top-level window with
+///    `EnumWindows` and return Warp's title regardless of focus. This keeps
+///    the presence active even when the user switches to another app.
+/// 2. Otherwise fall back to `GetForegroundWindow` so standalone tools
+///    (Neovim GUI, CocosCreator) are still detected when Warp is absent.
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
 };
 
-const WARP_EXE: &str = "warp.exe";
+use crate::models::ProcessInfo;
 
-// ─── Internal state passed through the EnumWindows callback ──────────────────
+// ─── Public snapshot ──────────────────────────────────────────────────────────
 
-struct SearchState {
+pub struct SystemSnapshot {
+    /// Most relevant window title for this poll tick (see module-level docs).
+    pub title: String,
+    /// All running processes with lower-cased names.
+    pub processes: Vec<ProcessInfo>,
+}
+
+// ─── EnumWindows helper ───────────────────────────────────────────────────────
+
+struct EnumState {
     target_pids: Vec<u32>,
     result: Option<String>,
 }
 
-/// Called by `EnumWindows` for every top-level window.
-/// Returns FALSE (stop) once we have a title; TRUE (continue) otherwise.
 unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    // SAFETY: lparam is always a valid &mut SearchState cast to isize,
-    // and all WinAPI calls below are safe given a valid HWND.
     unsafe {
-        let state = &mut *(lparam.0 as *mut SearchState);
+        let state = &mut *(lparam.0 as *mut EnumState);
 
-        // Skip invisible windows (minimised chrome, background helpers, …).
         if !IsWindowVisible(hwnd).as_bool() {
             return BOOL(1);
         }
@@ -44,62 +48,91 @@ unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
 
         let mut buf = [0u16; 512];
         let len = GetWindowTextW(hwnd, &mut buf);
-
         if len > 0 {
             let title = String::from_utf16_lossy(&buf[..len as usize]);
             let trimmed = title.trim().to_owned();
             if !trimmed.is_empty() {
                 state.result = Some(trimmed);
-                return BOOL(0); // stop – we have what we need
+                return BOOL(0); // stop – found it
             }
         }
 
-        BOOL(1) // continue to the next window
+        BOOL(1) // continue
+    }
+}
+
+/// Read the title of the current foreground window.
+fn foreground_title() -> String {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let mut buf = [0u16; 512];
+        let len = GetWindowTextW(hwnd, &mut buf);
+        if len > 0 {
+            String::from_utf16_lossy(&buf[..len as usize])
+                .trim()
+                .to_owned()
+        } else {
+            String::new()
+        }
     }
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-pub struct WarpWatcher {
+pub struct SystemMonitor {
     sys: System,
 }
 
-impl WarpWatcher {
+impl SystemMonitor {
     pub fn new() -> Self {
         Self { sys: System::new() }
     }
 
-    /// Returns the window title of the running Warp Terminal, or `None` if
-    /// Warp is not open / has no visible window with a title.
-    pub fn window_title(&mut self) -> Option<String> {
-        // Refresh only the process list – no CPU/memory/disk overhead.
+    pub fn snapshot(&mut self) -> SystemSnapshot {
+        // Refresh only what we need: process names.
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             ProcessRefreshKind::everything(),
         );
 
-        let pids: Vec<u32> = self
+        let processes: Vec<ProcessInfo> = self
             .sys
             .processes()
             .values()
-            .filter(|p| p.name().eq_ignore_ascii_case(WARP_EXE))
+            .map(|p| ProcessInfo {
+                name: p.name().to_str().unwrap_or("").to_lowercase(),
+            })
+            .collect();
+
+        // Collect Warp PIDs for the EnumWindows search.
+        let warp_pids: Vec<u32> = self
+            .sys
+            .processes()
+            .values()
+            .filter(|p| {
+                p.name()
+                    .to_str()
+                    .unwrap_or("")
+                    .eq_ignore_ascii_case("warp.exe")
+            })
             .map(|p| p.pid().as_u32())
             .collect();
 
-        if pids.is_empty() {
-            return None;
-        }
+        let title = if !warp_pids.is_empty() {
+            // Warp is running — find its visible window regardless of focus.
+            let mut state = EnumState { target_pids: warp_pids, result: None };
+            unsafe {
+                let _ = EnumWindows(
+                    Some(enum_callback),
+                    LPARAM(&mut state as *mut EnumState as isize),
+                );
+            }
+            state.result.unwrap_or_else(foreground_title)
+        } else {
+            // Warp not running — use whatever window is in focus.
+            foreground_title()
+        };
 
-        let mut state = SearchState { target_pids: pids, result: None };
-
-        // SAFETY: state lives for the entire duration of EnumWindows.
-        unsafe {
-            let _ = EnumWindows(
-                Some(enum_callback),
-                LPARAM(&mut state as *mut SearchState as isize),
-            );
-        }
-
-        state.result
+        SystemSnapshot { title, processes }
     }
 }

@@ -1,18 +1,14 @@
-/// Discord Rich Presence manager.
+/// Discord Rich Presence manager — pure transport layer.
 ///
-/// Wraps `discord_presence::Client` (v3.x) and handles:
-/// - Initial connection (best-effort; Discord may not be running).
-/// - Dynamic large-image key ("claude" vs "warp") based on window title.
-/// - Elapsed-time timestamp anchored to when Warp was first detected.
-/// - Silent error handling so a closed Discord never crashes the app.
+/// All asset / label logic lives in the `strategies` module.
+/// This module only concerns itself with the Discord IPC connection and
+/// translating a `PresenceData` value into an API call.
+///
+/// NOTE: App name ("Warp Pro") and the "Đang chơi" (Playing) label are
+/// Discord Developer Portal settings — they cannot be set from code.
+use crate::models::PresenceData;
 use discord_presence::Client;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-const DETAILS: &str = "Working in Warp Terminal";
-const IMG_WARP: &str = "warp";
-const IMG_CLAUDE: &str = "claude";
-
-// ─── Manager ──────────────────────────────────────────────────────────────────
 
 pub struct PresenceManager {
     client_id: u64,
@@ -26,24 +22,22 @@ impl PresenceManager {
         mgr
     }
 
-    /// Update Rich Presence for the given window title.
-    /// Silently retries the connection once if the first attempt fails.
-    pub fn update(&mut self, title: &str, started_at: Instant) {
-        if self.try_update(title, started_at).is_none() {
-            // Discord may have been launched after us – attempt reconnect.
+    /// Push a presence update. Reconnects once silently on failure.
+    pub fn update(&mut self, data: &PresenceData, started_at: Instant) {
+        if self.try_update(data, started_at).is_none() {
             self.connect();
-            self.try_update(title, started_at);
+            self.try_update(data, started_at);
         }
     }
 
-    /// Clear the Rich Presence (called when Warp closes).
+    /// Clear the Rich Presence (called when no detector fires).
     pub fn clear(&mut self) {
         if let Some(client) = &mut self.client {
             let _ = client.clear_activity();
         }
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────────
+    // ── Private ───────────────────────────────────────────────────────────────
 
     fn connect(&mut self) {
         let mut client = Client::new(self.client_id);
@@ -51,17 +45,9 @@ impl PresenceManager {
         self.client = Some(client);
     }
 
-    /// Returns `Some(())` on success, `None` on any error.
-    fn try_update(&mut self, title: &str, started_at: Instant) -> Option<()> {
+    fn try_update(&mut self, data: &PresenceData, started_at: Instant) -> Option<()> {
         let client = self.client.as_mut()?;
 
-        let large_image = if title.to_ascii_lowercase().contains("claude") {
-            IMG_CLAUDE
-        } else {
-            IMG_WARP
-        };
-
-        // Convert the Instant back to a Unix timestamp Discord understands.
         let elapsed_secs = started_at.elapsed().as_secs();
         let start_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -69,11 +55,25 @@ impl PresenceManager {
             .as_secs()
             .saturating_sub(elapsed_secs);
 
+        // Copy/slice the fields before the move closure so we don't capture
+        // `data` (a reference) inside a potentially 'static closure.
+        let details = data.details.as_str();
+        let state   = data.state.as_str();
+        let l_img   = data.large_image;
+        let l_txt   = data.large_text;
+        let s_img   = data.small_image;
+        let s_txt   = data.small_text;
+
         client
             .set_activity(|act| {
-                act.details(DETAILS)
-                    .state(title)
-                    .assets(|a| a.large_image(large_image).large_text("Warp Terminal"))
+                act.details(details)
+                    .state(state)
+                    .assets(|a| {
+                        a.large_image(l_img)
+                            .large_text(l_txt)
+                            .small_image(s_img)
+                            .small_text(s_txt)
+                    })
                     .timestamps(|t| t.start(start_unix))
             })
             .ok()?;

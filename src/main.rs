@@ -1,8 +1,19 @@
 // Hide the console window in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod models;
 mod monitor;
 mod presence;
+mod strategies;
+
+use strategies::{
+    AppDetector,
+    claude::ClaudeDetector,
+    cocos2dx::Cocos2dxDetector,
+    neovim::NeovimDetector,
+    rust::RustDetector,
+    warp::WarpDetector,
+};
 
 use std::{
     thread,
@@ -11,12 +22,10 @@ use std::{
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 //
-//  1. Go to https://discord.com/developers/applications
-//  2. Create (or select) an application and copy the "Client ID" (a 64-bit
-//     integer shown under OAuth2 → General).
-//  3. Paste it here.
+//  Get your Client ID from:
+//  https://discord.com/developers/applications → your app → OAuth2 → Client ID
 //
-const CLIENT_ID: u64 = 1143468205365530624; // <── replace with your Client ID
+const CLIENT_ID: u64 = 1143468205365530624;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -24,21 +33,41 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 fn main() {
     let mut discord = presence::PresenceManager::new(CLIENT_ID);
-    let mut watcher = monitor::WarpWatcher::new();
+    let mut monitor = monitor::SystemMonitor::new();
 
-    // The instant Warp was first detected; cleared when Warp exits.
-    let mut warp_start: Option<Instant> = None;
+    // Priority-ordered detector chain — first Some(_) wins.
+    //
+    //  1. NeovimDetector   — nvim / Neovim editing session
+    //  2. RustDetector     — Cargo / Rust build session
+    //  3. Cocos2dxDetector — Cocos2dx game project (asset key: "cocos2dx")
+    //  4. ClaudeDetector   — Claude AI session (title contains "claude")
+    //  5. WarpDetector     — Warp Terminal fallback (always fires if warp.exe running)
+    let detectors: Vec<Box<dyn AppDetector>> = vec![
+        Box::new(NeovimDetector),
+        Box::new(RustDetector),
+        Box::new(Cocos2dxDetector),
+        Box::new(ClaudeDetector),
+        Box::new(WarpDetector),
+    ];
+
+    // Session timer: starts when the first detector fires, resets only when
+    // all detectors return None (no recognised app running).
+    let mut session_start: Option<Instant> = None;
 
     loop {
-        match watcher.window_title() {
-            Some(title) => {
-                // Record start time only the first time we see Warp.
-                let started_at = *warp_start.get_or_insert_with(Instant::now);
-                discord.update(&title, started_at);
+        let snapshot = monitor.snapshot();
+
+        let result = detectors
+            .iter()
+            .find_map(|d| d.detect(&snapshot.title, &snapshot.processes));
+
+        match result {
+            Some(data) => {
+                let started_at = *session_start.get_or_insert_with(Instant::now);
+                discord.update(&data, started_at);
             }
             None => {
-                // Warp just closed – clear the presence once, then forget.
-                if warp_start.take().is_some() {
+                if session_start.take().is_some() {
                     discord.clear();
                 }
             }
