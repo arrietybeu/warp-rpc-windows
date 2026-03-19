@@ -4,3 +4,23 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# ──────────────────────────────────────────────────────────────────────────────
+# Replace the placeholder below with your real CLIENT_ID from
+# https://discord.com/developers/applications → "OAuth2" → "Client ID"
+# ──────────────────────────────────────────────────────────────────────────────
+discord-presence = "3"
+sysinfo           = "0.31"
+
+[dependencies.windows]
+version  = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+# ── Lean release binary ───────────────────────────────────────────────────────
+[profile.release]
+opt-level     = "s"   # optimise for size
+lto           = true
+strip         = true
+codegen-units = 1
