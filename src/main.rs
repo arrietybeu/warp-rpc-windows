@@ -76,18 +76,14 @@ fn main() {
 
             // ── Background: Warp is running but not focused ───────────────────
             //
-            // Keep last_presence on Discord with "(Background)" appended to
-            // details so the user can see they have an active terminal session
-            // without being at the keyboard.
+            // Keep last_presence on Discord exactly as-is — no suffix added.
             PollResult::Background => {
                 #[cfg(debug_assertions)]
                 eprintln!("[warp-rpc] background | warp running but not foreground");
 
                 if let Some(ref data) = last_presence {
                     let started_at = *session_start.get_or_insert_with(Instant::now);
-                    let mut bg = data.clone();
-                    bg.details = format!("{} (Background)", data.details);
-                    discord.update(&bg, started_at);
+                    discord.update(data, started_at);
                 }
             }
 

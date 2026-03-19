@@ -11,6 +11,7 @@
 /// tab's title.  A cargo build running in a DIFFERENT tab would otherwise
 /// trigger this detector for unrelated tabs (e.g. a Claude Code tab).
 ///
+/// Details line: "đang Debug rust ở folder <folder>"
 /// State line mapping
 /// ──────────────────
 ///   "cargo build …"  →  "Running: Build"
@@ -20,20 +21,22 @@
 ///   "cargo clippy …" →  "Running: Clippy"
 ///   "cargo fmt …"    →  "Running: Fmt"
 ///   (other)          →  "Running: Cargo"
+use std::path::Path;
+
 use crate::models::PresenceData;
 use crate::strategies::AppDetector;
 
 /// (lowercase subcommand, display label)
 const SUBCOMMANDS: &[(&str, &str)] = &[
-    ("build",   "Build"),
-    ("check",   "Check"),
-    ("run",     "Run"),
-    ("test",    "Test"),
-    ("clippy",  "Clippy"),
-    ("fmt",     "Fmt"),
-    ("doc",     "Doc"),
-    ("bench",   "Bench"),
-    ("clean",   "Clean"),
+    ("build",  "Build"),
+    ("check",  "Check"),
+    ("run",    "Run"),
+    ("test",   "Test"),
+    ("clippy", "Clippy"),
+    ("fmt",    "Fmt"),
+    ("doc",    "Doc"),
+    ("bench",  "Bench"),
+    ("clean",  "Clean"),
 ];
 
 pub struct RustDetector;
@@ -50,10 +53,11 @@ impl AppDetector for RustDetector {
             return None;
         }
 
+        let folder = extract_folder(window_title);
         let state = detect_cargo_task(&title_lower);
 
         Some(PresenceData {
-            details: "Rust Engineering Session".to_owned(),
+            details: format!("[Debug] {folder}"),
             state,
             large_image: "rust",
             large_text: "Rust / Cargo",
@@ -67,10 +71,35 @@ impl AppDetector for RustDetector {
 
 fn detect_cargo_task(title_lower: &str) -> String {
     for &(cmd, label) in SUBCOMMANDS {
-        // Match "cargo <cmd>" to avoid false positives on unrelated words.
         if title_lower.contains(&format!("cargo {cmd}")) {
             return format!("Running: {label}");
         }
     }
     "Running: Cargo".to_owned()
+}
+
+/// Extract the leaf folder name from a Warp window title.
+///
+/// Warp formats:
+///   "cargo run — tram-quy — Warp"  →  "tram-quy"
+///   "cargo run"                     →  "cargo run"  (no separator)
+fn extract_folder(title: &str) -> String {
+    // Warp title format: "<command> — <folder> — Warp"
+    // Split on em dash and take the middle segment, falling back to the full title.
+    let parts: Vec<&str> = title.split('\u{2014}').collect();
+
+    let candidate = if parts.len() >= 2 {
+        // Middle segment is the folder; last segment is " Warp"
+        parts[parts.len() - 2].trim()
+    } else {
+        title.trim()
+    };
+
+    let leaf = Path::new(candidate)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(candidate);
+
+    if leaf.is_empty() { "unknown".to_owned() } else { leaf.to_owned() }
 }
