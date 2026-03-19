@@ -39,9 +39,9 @@ fn main() {
     //
     //  1. NeovimDetector   — nvim / Neovim editing session
     //  2. RustDetector     — Cargo / Rust build session
-    //  3. Cocos2dxDetector — Cocos2dx game project (asset key: "cocos2dx")
-    //  4. ClaudeDetector   — Claude AI session (title contains "claude")
-    //  5. WarpDetector     — Warp Terminal fallback (always fires if warp.exe running)
+    //  3. Cocos2dxDetector — Cocos2dx game project  (asset key: "cocos2dx")
+    //  4. ClaudeDetector   — Claude AI session       (title contains "claude")
+    //  5. WarpDetector     — Warp Terminal fallback  (always fires when Warp focused)
     let detectors: Vec<Box<dyn AppDetector>> = vec![
         Box::new(NeovimDetector),
         Box::new(RustDetector),
@@ -50,16 +50,19 @@ fn main() {
         Box::new(WarpDetector),
     ];
 
-    // Session timer: starts when the first detector fires, resets only when
-    // all detectors return None (no recognised app running).
+    // Session timer resets only when no detector fires (presence fully cleared).
     let mut session_start: Option<Instant> = None;
 
     loop {
-        let snapshot = monitor.snapshot();
-
-        let result = detectors
-            .iter()
-            .find_map(|d| d.detect(&snapshot.title, &snapshot.processes));
+        // monitor.snapshot() returns None when Warp is not the focused window,
+        // which short-circuits the entire detector chain and clears presence.
+        let result = monitor
+            .snapshot()
+            .and_then(|snap| {
+                detectors
+                    .iter()
+                    .find_map(|d| d.detect(&snap.title, &snap.processes))
+            });
 
         match result {
             Some(data) => {

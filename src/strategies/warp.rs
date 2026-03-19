@@ -39,7 +39,9 @@ impl AppDetector for WarpDetector {
 ///   "C:\Users\Huy\Game — Warp"    →  "Game"
 ///   "Warp"                         →  "Warp Terminal"
 fn extract_folder(title: &str) -> String {
-    // Take the left-hand side of the " — Warp" suffix.
+    use std::path::Path;
+
+    // Take the left-hand side of the " — Warp" separator.
     let lhs = title
         .split('\u{2014}') // em dash
         .next()
@@ -47,15 +49,13 @@ fn extract_folder(title: &str) -> String {
         .unwrap_or(title)
         .trim();
 
-    // For filesystem paths keep only the last component.
-    let leaf = if lhs.contains('\\') || lhs.contains('/') {
-        lhs.split(['\\', '/'])
-            .filter(|s| !s.is_empty())
-            .last()
-            .unwrap_or(lhs)
-    } else {
-        lhs
-    };
+    // Path::file_name() robustly extracts the last component from any path
+    // format (forward slash, backslash, UNC, bare name, etc.).
+    let leaf = Path::new(lhs)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(lhs);
 
     if leaf.is_empty() || leaf.eq_ignore_ascii_case("warp") {
         "Warp Terminal".to_owned()

@@ -1,83 +1,36 @@
-/// System monitor: gathers the window title and process list each poll tick.
+/// System monitor — foreground-window-first design.
 ///
-/// Title resolution strategy
-/// ─────────────────────────
-/// 1. If `warp.exe` is running, search every top-level window with
-///    `EnumWindows` and return Warp's title regardless of focus. This keeps
-///    the presence active even when the user switches to another app.
-/// 2. Otherwise fall back to `GetForegroundWindow` so standalone tools
-///    (Neovim GUI, CocosCreator) are still detected when Warp is absent.
+/// Each poll tick:
+///   1. Refresh the process list (sysinfo).
+///   2. Confirm `warp.exe` is running at all — if not, return `None`.
+///   3. Call `GetForegroundWindow` to get the window the user is looking at.
+///   4. Verify that window's PID belongs to a `warp.exe` process.
+///      If the active window is NOT Warp (browser, Discord, etc.), return `None`
+///      so the caller can clear the Discord presence immediately.
+///   5. Read that window's title with `GetWindowTextW` — this is always the
+///      title of the active Warp tab, so switching tabs updates presence on
+///      the very next poll tick.
+///
+/// Returning `Option` gives `main.rs` a clean signal: `None` means "nothing
+/// to show", `Some` means "show this snapshot".
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
 };
 
 use crate::models::ProcessInfo;
 
-// ─── Public snapshot ──────────────────────────────────────────────────────────
+// ─── Public types ─────────────────────────────────────────────────────────────
 
 pub struct SystemSnapshot {
-    /// Most relevant window title for this poll tick (see module-level docs).
+    /// Title of the active (focused) Warp window — reflects the current tab.
     pub title: String,
     /// All running processes with lower-cased names.
     pub processes: Vec<ProcessInfo>,
 }
 
-// ─── EnumWindows helper ───────────────────────────────────────────────────────
-
-struct EnumState {
-    target_pids: Vec<u32>,
-    result: Option<String>,
-}
-
-unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    unsafe {
-        let state = &mut *(lparam.0 as *mut EnumState);
-
-        if !IsWindowVisible(hwnd).as_bool() {
-            return BOOL(1);
-        }
-
-        let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut pid));
-
-        if !state.target_pids.contains(&pid) {
-            return BOOL(1);
-        }
-
-        let mut buf = [0u16; 512];
-        let len = GetWindowTextW(hwnd, &mut buf);
-        if len > 0 {
-            let title = String::from_utf16_lossy(&buf[..len as usize]);
-            let trimmed = title.trim().to_owned();
-            if !trimmed.is_empty() {
-                state.result = Some(trimmed);
-                return BOOL(0); // stop – found it
-            }
-        }
-
-        BOOL(1) // continue
-    }
-}
-
-/// Read the title of the current foreground window.
-fn foreground_title() -> String {
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        let mut buf = [0u16; 512];
-        let len = GetWindowTextW(hwnd, &mut buf);
-        if len > 0 {
-            String::from_utf16_lossy(&buf[..len as usize])
-                .trim()
-                .to_owned()
-        } else {
-            String::new()
-        }
-    }
-}
-
-// ─── Public API ───────────────────────────────────────────────────────────────
+// ─── Monitor ──────────────────────────────────────────────────────────────────
 
 pub struct SystemMonitor {
     sys: System,
@@ -88,13 +41,15 @@ impl SystemMonitor {
         Self { sys: System::new() }
     }
 
-    pub fn snapshot(&mut self) -> SystemSnapshot {
-        // Refresh only what we need: process names.
+    /// Returns `Some(snapshot)` only when a Warp window is in the foreground.
+    /// Returns `None` if Warp is not running or the user has switched away from it.
+    pub fn snapshot(&mut self) -> Option<SystemSnapshot> {
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             ProcessRefreshKind::everything(),
         );
 
+        // Collect all processes (lower-cased names for detectors).
         let processes: Vec<ProcessInfo> = self
             .sys
             .processes()
@@ -104,7 +59,7 @@ impl SystemMonitor {
             })
             .collect();
 
-        // Collect Warp PIDs for the EnumWindows search.
+        // Bail out early if Warp is not running at all.
         let warp_pids: Vec<u32> = self
             .sys
             .processes()
@@ -118,21 +73,51 @@ impl SystemMonitor {
             .map(|p| p.pid().as_u32())
             .collect();
 
-        let title = if !warp_pids.is_empty() {
-            // Warp is running — find its visible window regardless of focus.
-            let mut state = EnumState { target_pids: warp_pids, result: None };
-            unsafe {
-                let _ = EnumWindows(
-                    Some(enum_callback),
-                    LPARAM(&mut state as *mut EnumState as isize),
-                );
-            }
-            state.result.unwrap_or_else(foreground_title)
-        } else {
-            // Warp not running — use whatever window is in focus.
-            foreground_title()
-        };
+        if warp_pids.is_empty() {
+            return None;
+        }
 
-        SystemSnapshot { title, processes }
+        // Ask Windows which window the user is currently looking at.
+        let (hwnd, fg_pid) = foreground_window();
+
+        // If the focused window does not belong to Warp, produce no snapshot.
+        // This clears presence the moment the user alt-tabs away from Warp.
+        if !warp_pids.contains(&fg_pid) {
+            return None;
+        }
+
+        // The foreground window IS a Warp window — read its title.
+        // This is the title of the active tab, so switching tabs is reflected
+        // on the very next poll without any special handling.
+        let title = window_text(hwnd)?;
+
+        Some(SystemSnapshot { title, processes })
+    }
+}
+
+// ─── WinAPI helpers ───────────────────────────────────────────────────────────
+
+/// Returns the `(HWND, PID)` pair for the currently focused window.
+fn foreground_window() -> (HWND, u32) {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        (hwnd, pid)
+    }
+}
+
+/// Reads the window title of `hwnd`. Returns `None` for empty / unreadable titles.
+fn window_text(hwnd: HWND) -> Option<String> {
+    unsafe {
+        let mut buf = [0u16; 512];
+        let len = GetWindowTextW(hwnd, &mut buf);
+        if len > 0 {
+            let title = String::from_utf16_lossy(&buf[..len as usize]);
+            let trimmed = title.trim().to_owned();
+            if !trimmed.is_empty() { Some(trimmed) } else { None }
+        } else {
+            None
+        }
     }
 }

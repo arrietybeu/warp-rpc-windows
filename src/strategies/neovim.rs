@@ -88,16 +88,16 @@ fn parse_nvim_title(raw: &str) -> (String, String) {
         .filter(|s| !s.is_empty())
         .unwrap_or("unknown");
 
-    // Prefer the grandparent directory as "project" — it skips intermediate
-    // "src" / "lib" folders and lands on the actual project root.
-    // e.g. …/tram-quy/src/main.rs  →  grandparent = "tram-quy"
+    // Walk up the path to find the project root.
+    // "…/tram-quy/src/main.rs"
+    //     grandparent ──┘          → "tram-quy"  (preferred: skips "src")
+    //     parent ────────────────  → "src"        (fallback when no mid-level)
     let project = path
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.file_name())
+        .parent()                           // …/tram-quy/src
+        .and_then(|p| p.parent())           // …/tram-quy
+        .and_then(|p| p.file_name())        // OsStr "tram-quy"
         .and_then(|s| s.to_str())
         .or_else(|| {
-            // Fallback: immediate parent (no "src"-like level)
             path.parent()
                 .and_then(|p| p.file_name())
                 .and_then(|s| s.to_str())
