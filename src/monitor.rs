@@ -1,21 +1,19 @@
-/// System monitor — foreground-window-first design.
+/// System monitor — sticky-presence design.
 ///
 /// Each poll tick:
 ///   1. Refresh the process list (sysinfo).
-///   2. Confirm `warp.exe` is running at all — if not, return `None`.
+///   2. Check whether `warp.exe` is in the process list at all.
+///      → No  : return `PollResult::Gone`  (presence cleared).
+///      → Yes : continue.
 ///   3. Call `GetForegroundWindow` to get the window the user is looking at.
-///   4. Verify that window's PID (or its parent's PID) belongs to a `warp.exe`
-///      process.  Warp on Windows can host the active window under a GPU/render
-///      child process rather than the main warp.exe — checking one level up in
-///      the process tree makes the check robust to that.
-///      If the active window is NOT Warp (browser, Discord, etc.), return `None`
-///      so the caller can clear the Discord presence immediately.
-///   5. Read that window's title with `GetWindowTextW` — this is always the
-///      title of the active Warp tab, so switching tabs updates presence on
-///      the very next poll tick.
+///   4. Check whether that window's PID (or its parent) belongs to `warp.exe`.
+///      → Yes : read the window title, return `PollResult::Active(snapshot)`.
+///      → No  : return `PollResult::Background`  (warp is running but not focused).
 ///
-/// Returning `Option` gives `main.rs` a clean signal: `None` means "nothing
-/// to show", `Some` means "show this snapshot".
+/// The three-state result lets `main.rs` implement sticky presence:
+///   Active     → update Discord with live tab info.
+///   Background → keep the last known presence, append " (Background)" to details.
+///   Gone       → clear Discord entirely.
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -24,8 +22,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
+/// Result of one monitor poll tick.
+pub enum PollResult {
+    /// Warp is the focused window — title of the active tab is available.
+    Active(SystemSnapshot),
+    /// Warp is running but is not the foreground window (user is in a browser,
+    /// Discord, etc.).  The last-known presence should be kept on Discord with
+    /// a "(Background)" marker.
+    Background,
+    /// `warp.exe` is not running at all — Discord presence should be cleared.
+    Gone,
+}
+
 pub struct SystemSnapshot {
-    /// Title of the active (focused) Warp window — reflects the current tab.
+    /// Title of the active (focused) Warp tab.
     pub title: String,
 }
 
@@ -40,15 +50,14 @@ impl SystemMonitor {
         Self { sys: System::new() }
     }
 
-    /// Returns `Some(snapshot)` only when a Warp window is in the foreground.
-    /// Returns `None` if Warp is not running or the user has switched away from it.
-    pub fn snapshot(&mut self) -> Option<SystemSnapshot> {
+    /// Poll the current Warp state.  One sysinfo refresh per tick — no extra scans.
+    pub fn poll(&mut self) -> PollResult {
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             ProcessRefreshKind::everything(),
         );
 
-        // Bail out early if Warp is not running at all.
+        // Collect all PIDs whose executable name is warp.exe.
         let warp_pids: Vec<u32> = self
             .sys
             .processes()
@@ -62,22 +71,17 @@ impl SystemMonitor {
             .map(|p| p.pid().as_u32())
             .collect();
 
+        // If Warp is not running at all, nothing to show.
         if warp_pids.is_empty() {
-            return None;
+            return PollResult::Gone;
         }
 
         // Ask Windows which window the user is currently looking at.
         let (hwnd, fg_pid) = foreground_window();
 
-        // Check whether the foreground window belongs to Warp — either directly
-        // (fg_pid is a warp.exe PID) or indirectly (fg_pid is a child of warp.exe).
-        // The indirect check is necessary because Warp on Windows can host tabs
-        // under GPU/renderer subprocesses whose PID differs from the main warp.exe.
-        //
-        // We also explicitly ignore our own PID: in debug builds this process has a
-        // visible console window, and Windows can briefly give it keyboard focus
-        // right after we write to it (eprintln!).  That transient focus steal must
-        // not be misread as "user switched away from Warp".
+        // Check whether the foreground window belongs to Warp — directly or via
+        // a GPU/renderer child process (which owns the actual window on some configs).
+        // Also ignore our own debug console window that can briefly steal focus.
         let our_pid = std::process::id();
         let is_warp_window = warp_pids.contains(&fg_pid)
             || fg_pid == our_pid
@@ -89,26 +93,18 @@ impl SystemMonitor {
                     .unwrap_or(false)
             };
 
-        #[cfg(debug_assertions)]
         if !is_warp_window {
+            #[cfg(debug_assertions)]
             eprintln!(
-                "[warp-rpc] monitor: fg_pid={fg_pid} not in warp_pids={warp_pids:?} — skipping"
+                "[warp-rpc] monitor: fg_pid={fg_pid} not warp — background mode"
             );
+            return PollResult::Background;
         }
 
-        if !is_warp_window {
-            return None;
-        }
-
-        // The foreground window IS a Warp window — read its title.
-        // unwrap_or_default() is intentional: a blank/new Warp tab returns an
-        // empty window title. We must NOT propagate None here, because that
-        // would skip every detector (including WarpDetector) and clear the
-        // Discord presence. An empty title is handled gracefully downstream —
-        // WarpDetector will show a generic "Warp Terminal Session" fallback.
+        // Warp IS focused — read the active tab's title.
+        // unwrap_or_default(): an empty tab title is valid; WarpDetector handles it.
         let title = window_text(hwnd).unwrap_or_default();
-
-        Some(SystemSnapshot { title })
+        PollResult::Active(SystemSnapshot { title })
     }
 }
 
@@ -124,7 +120,7 @@ fn foreground_window() -> (HWND, u32) {
     }
 }
 
-/// Reads the window title of `hwnd`. Returns `None` for empty / unreadable titles.
+/// Reads the window title of `hwnd`.  Returns `None` for empty / unreadable titles.
 fn window_text(hwnd: HWND) -> Option<String> {
     unsafe {
         let mut buf = [0u16; 512];

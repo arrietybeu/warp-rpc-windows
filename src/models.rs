@@ -4,6 +4,7 @@
 
 /// Everything `PresenceManager::update` needs to push one Discord activity.
 /// Produced by an `AppDetector` and consumed directly by `PresenceManager`.
+#[derive(Clone)]
 pub struct PresenceData {
     /// Line 1 of the Discord card (dynamic, e.g. "Engineering warpcord-win").
     pub details: String,
